@@ -17,6 +17,7 @@ struct AddMacroView: View {
     @State private var name = ""
     @State private var command = ""
     @State private var category = "Default"
+    @State private var isFavorite = false
 
     var body: some View {
         NavigationView {
@@ -29,8 +30,9 @@ struct AddMacroView: View {
                         .font(.system(.body, design: .monospaced))
                 }
 
-                Section(header: Text("Category")) {
+                Section(header: Text("Options")) {
                     TextField("Category", text: $category)
+                    Toggle("Add to Favorites", isOn: $isFavorite)
                 }
             }
             .navigationTitle(macro == nil ? "Add Command" : "Edit Command")
@@ -53,6 +55,7 @@ struct AddMacroView: View {
                     name = macro.name
                     command = macro.command
                     category = macro.category
+                    isFavorite = macro.isFavorite
                 }
             }
         }
@@ -63,8 +66,9 @@ struct AddMacroView: View {
             macro.name = name
             macro.command = command
             macro.category = category
+            macro.isFavorite = isFavorite
         } else {
-            let newMacro = MacroCommand(name: name, command: command, category: category)
+            let newMacro = MacroCommand(name: name, command: command, category: category, isFavorite: isFavorite)
             modelContext.insert(newMacro)
         }
         dismiss()

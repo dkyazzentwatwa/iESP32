@@ -12,6 +12,7 @@ import CoreBluetooth
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Query(sort: \TerminalMessage.timestamp, order: .forward) private var messages: [TerminalMessage]
+    @Query(filter: #Predicate<MacroCommand> { $0.isFavorite }, sort: \MacroCommand.name) private var favoriteMacros: [MacroCommand]
 
     @StateObject private var bluetoothManager = BluetoothManager()
     @StateObject private var settings = SettingsManager()
@@ -76,6 +77,15 @@ struct ContentView: View {
 
                 // Terminal display
                 terminalView
+
+                Divider()
+
+                // Favorite Macros Bar
+                if !favoriteMacros.isEmpty {
+                    favoritesBar
+                        .padding(.vertical, 4)
+                        .background(Color(uiColor: .secondarySystemBackground).opacity(0.5))
+                }
 
                 Divider()
 
@@ -192,6 +202,11 @@ struct ContentView: View {
             .disabled(bluetoothManager.bluetoothState != .poweredOn && bluetoothManager.connectionState == .disconnected)
 
             Spacer()
+
+            if bluetoothManager.connectionState == .connected {
+                rssiIndicator
+                    .padding(.trailing, 8)
+            }
 
             if bluetoothManager.isScanning {
                 ProgressView()
@@ -492,6 +507,58 @@ struct ContentView: View {
     private func navigateToPreviousResult() {
         guard !searchResults.isEmpty else { return }
         currentSearchResult = (currentSearchResult - 1 + searchResults.count) % searchResults.count
+    }
+
+    // MARK: - RSSI Indicator
+    private var rssiIndicator: some View {
+        HStack(spacing: 4) {
+            Image(systemName: rssiIconName)
+            Text("\(bluetoothManager.rssiValue) dBm")
+                .font(.caption2)
+                .monospacedDigit()
+        }
+        .foregroundColor(bluetoothManager.connectionQuality.color)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(bluetoothManager.connectionQuality.color.opacity(0.1))
+        .cornerRadius(4)
+    }
+
+    private var rssiIconName: String {
+        let rssi = bluetoothManager.rssiValue
+        if rssi == 0 { return "wifi.exclamationmark" }
+        if rssi > -60 { return "wifi" }
+        if rssi > -70 { return "wifi" }
+        if rssi > -80 { return "wifi" }
+        return "wifi.exclamationmark"
+    }
+
+    // MARK: - Favorites Bar
+    private var favoritesBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 12) {
+                ForEach(favoriteMacros) { macro in
+                    Button(action: {
+                        bluetoothManager.sendMessage(macro.command)
+                    }) {
+                        Text(macro.name)
+                            .font(.caption)
+                            .fontWeight(.medium)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Color.blue.opacity(0.1))
+                            .foregroundColor(.blue)
+                            .cornerRadius(16)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 16)
+                                    .stroke(Color.blue.opacity(0.2), lineWidth: 1)
+                            )
+                    }
+                    .disabled(bluetoothManager.connectionState != .connected)
+                }
+            }
+            .padding(.horizontal)
+        }
     }
 
     // MARK: - Export

@@ -32,8 +32,15 @@ struct MacroListView: View {
                 ForEach(macros) { macro in
                     HStack {
                         VStack(alignment: .leading) {
-                            Text(macro.name)
-                                .font(.headline)
+                            HStack {
+                                Text(macro.name)
+                                    .font(.headline)
+                                if macro.isFavorite {
+                                    Image(systemName: "star.fill")
+                                        .foregroundColor(.yellow)
+                                        .font(.caption)
+                                }
+                            }
                             Text(macro.command)
                                 .font(.system(.subheadline, design: .monospaced))
                                 .foregroundColor(.secondary)
@@ -65,6 +72,13 @@ struct MacroListView: View {
                             Label("Edit", systemImage: "pencil")
                         }
                         .tint(.orange)
+
+                        Button {
+                            macro.isFavorite.toggle()
+                        } label: {
+                            Label(macro.isFavorite ? "Unfavorite" : "Favorite", systemImage: macro.isFavorite ? "star.slash" : "star")
+                        }
+                        .tint(.yellow)
                     }
                 }
             }
