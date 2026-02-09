@@ -12,6 +12,7 @@ import CoreBluetooth
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Query(sort: \TerminalMessage.timestamp, order: .forward) private var messages: [TerminalMessage]
+    @Query(filter: #Predicate<MacroCommand> { $0.isFavorite }, sort: \MacroCommand.name) private var favoriteMacros: [MacroCommand]
 
     @StateObject private var bluetoothManager = BluetoothManager()
     @StateObject private var settings = SettingsManager()
@@ -25,6 +26,7 @@ struct ContentView: View {
 
     // Search & Filter State
     @State private var showSearch = false
+    @State private var showMacros = false
     @State private var searchText = ""
     @State private var caseSensitive = false
     @State private var useRegex = false
@@ -78,6 +80,15 @@ struct ContentView: View {
 
                 Divider()
 
+                // Favorite Macros Bar
+                if !favoriteMacros.isEmpty {
+                    favoritesBar
+                        .padding(.vertical, 4)
+                        .background(Color(uiColor: .secondarySystemBackground).opacity(0.5))
+                }
+
+                Divider()
+
                 // Input area
                 inputArea
                     .padding()
@@ -90,6 +101,11 @@ struct ContentView: View {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button(action: { withAnimation { showSearch.toggle() } }) {
                         Image(systemName: showSearch ? "xmark" : "magnifyingglass")
+                    }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    ShareLink(item: generateExportString()) {
+                        Image(systemName: "square.and.arrow.up")
                     }
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
@@ -119,6 +135,9 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showFilters) {
                 FilterOptionsView(filterDirection: $filterDirection, filterTimeRange: $filterTimeRange)
+            }
+            .sheet(isPresented: $showMacros) {
+                MacroListView(bluetoothManager: bluetoothManager)
             }
             .alert(isPresented: $bluetoothManager.showAlert) {
                 Alert(
@@ -183,6 +202,11 @@ struct ContentView: View {
             .disabled(bluetoothManager.bluetoothState != .poweredOn && bluetoothManager.connectionState == .disconnected)
 
             Spacer()
+
+            if bluetoothManager.connectionState == .connected {
+                rssiIndicator
+                    .padding(.trailing, 8)
+            }
 
             if bluetoothManager.isScanning {
                 ProgressView()
@@ -249,8 +273,11 @@ struct ContentView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 4) {
                     ForEach(Array((showSearch || filterDirection != nil || filterTimeRange != .allTime ? filteredMessages : displayedMessages).enumerated()), id: \.element.id) { index, message in
-                        TerminalMessageView(message: message, settings: settings, lineNumber: index + 1)
-                            .id(message.id)
+                        TerminalMessageView(message: message, settings: settings, lineNumber: index + 1) { content in
+                            messageText = content
+                            sendMessage()
+                        }
+                        .id(message.id)
                     }
                 }
                 .padding()
@@ -309,6 +336,13 @@ struct ContentView: View {
                     .font(.title2)
             }
             .disabled(messageText.isEmpty || bluetoothManager.connectionState != .connected)
+
+            // Macros button
+            Button(action: { showMacros = true }) {
+                Image(systemName: "list.bullet.rectangle.fill")
+                    .font(.title3)
+            }
+            .buttonStyle(.bordered)
 
             // Clear button
             Button(action: clearTerminal) {
@@ -473,6 +507,103 @@ struct ContentView: View {
     private func navigateToPreviousResult() {
         guard !searchResults.isEmpty else { return }
         currentSearchResult = (currentSearchResult - 1 + searchResults.count) % searchResults.count
+    }
+
+    // MARK: - RSSI Indicator
+    private var rssiIndicator: some View {
+        HStack(spacing: 4) {
+            Image(systemName: rssiIconName)
+            Text("\(bluetoothManager.rssiValue) dBm")
+                .font(.caption2)
+                .monospacedDigit()
+        }
+        .foregroundColor(bluetoothManager.connectionQuality.color)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(bluetoothManager.connectionQuality.color.opacity(0.1))
+        .cornerRadius(4)
+    }
+
+    private var rssiIconName: String {
+        let rssi = bluetoothManager.rssiValue
+        if rssi == 0 { return "wifi.exclamationmark" }
+        if rssi > -60 { return "wifi" }
+        if rssi > -70 { return "wifi" }
+        if rssi > -80 { return "wifi" }
+        return "wifi.exclamationmark"
+    }
+
+    // MARK: - Favorites Bar
+    private var favoritesBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 12) {
+                ForEach(favoriteMacros) { macro in
+                    Button(action: {
+                        bluetoothManager.sendMessage(macro.command)
+                    }) {
+                        Text(macro.name)
+                            .font(.caption)
+                            .fontWeight(.medium)
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Color.blue.opacity(0.1))
+                            .foregroundColor(.blue)
+                            .cornerRadius(16)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 16)
+                                    .stroke(Color.blue.opacity(0.2), lineWidth: 1)
+                            )
+                    }
+                    .disabled(bluetoothManager.connectionState != .connected)
+                }
+            }
+            .padding(.horizontal)
+        }
+    }
+
+    // MARK: - Export
+    private func generateExportString() -> String {
+        let messagesToExport = filteredMessages
+        guard !messagesToExport.isEmpty else { return "No messages to export" }
+
+        switch settings.exportFormat {
+        case "csv":
+            var csv = "Timestamp,Direction,Device,Content\n"
+            for message in messagesToExport {
+                let device = message.deviceName ?? "None"
+                let content = message.content.replacingOccurrences(of: "\"", with: "\"\"")
+                csv += "\(message.timestamp),\(message.direction.rawValue),\(device),\"\(content)\"\n"
+            }
+            return csv
+
+        case "json":
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .prettyPrinted
+            encoder.dateEncodingStrategy = .iso8601
+
+            struct MessageDTO: Codable {
+                let timestamp: Date
+                let content: String
+                let direction: String
+                let deviceName: String?
+            }
+
+            let dtos = messagesToExport.map { MessageDTO(timestamp: $0.timestamp, content: $0.content, direction: $0.direction.rawValue, deviceName: $0.deviceName) }
+            if let data = try? encoder.encode(dtos), let str = String(data: data, encoding: .utf8) {
+                return str
+            }
+            return "Error generating JSON"
+
+        default: // "text"
+            var text = "--- iESP32 Terminal Log ---\n"
+            text += "Exported on: \(Date())\n\n"
+            for message in messagesToExport {
+                let timestamp = "[\(message.timestamp)] "
+                let direction = message.direction == .sent ? ">> " : "<< "
+                text += "\(timestamp)\(direction)\(message.content)\n"
+            }
+            return text
+        }
     }
 }
 

@@ -13,6 +13,7 @@ struct iESP32App: App {
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
             TerminalMessage.self,
+            MacroCommand.self,
         ])
         let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
 

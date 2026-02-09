@@ -89,7 +89,7 @@ class BluetoothManager: NSObject, ObservableObject {
     private var bytesInLastSecond: Int = 0
 
     // Message buffering for incoming data
-    private var receiveBuffer: String = ""
+    private var receiveBuffer = Data()
 
     // Nordic UART Service UUIDs (nonisolated - these are constants)
     nonisolated(unsafe) private let nordicUARTServiceUUID = CBUUID(string: "6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
@@ -296,7 +296,7 @@ class BluetoothManager: NSObject, ObservableObject {
         connectionState = .disconnected
 
         // Clear receive buffer
-        receiveBuffer = ""
+        receiveBuffer = Data()
     }
 
     private func showAlert(message: String) {
@@ -492,37 +492,8 @@ extension BluetoothManager: CBPeripheralDelegate {
             print("📦 BLE RX [\(data.count) bytes]: \(hexString)")
         }
 
-        // Simplified approach: Try UTF-8 decode, filter out invalid bytes if it fails
-        if let str = String(data: data, encoding: .utf8) {
-            // Valid UTF-8 - use it directly
-            if settingsManager?.debugMode == true {
-                print("✅ UTF-8: \"\(str.debugDescription)\"")
-            }
-            receiveBuffer += str
-        } else {
-            // Contains invalid UTF-8 - filter out non-printable bytes
-            let validBytes = data.filter { byte in
-                // Keep printable ASCII (0x20-0x7E) and common control chars
-                (byte >= 0x20 && byte <= 0x7E) ||  // Printable ASCII
-                byte == 0x0A ||  // LF
-                byte == 0x0D ||  // CR
-                byte == 0x09     // Tab
-            }
-
-            if let str = String(data: Data(validBytes), encoding: .utf8) {
-                if settingsManager?.debugMode == true {
-                    print("⚠️ FILTERED (\(data.count - validBytes.count) invalid bytes): \"\(str.debugDescription)\"")
-                }
-                receiveBuffer += str
-            } else {
-                // Still can't decode - show as hex
-                let hexStr = data.map { String(format: "<%02X>", $0) }.joined()
-                if settingsManager?.debugMode == true {
-                    print("❌ BINARY: \(hexStr)")
-                }
-                receiveBuffer += hexStr
-            }
-        }
+        // Append to buffer
+        receiveBuffer.append(data)
 
         // Process complete lines
         processCompleteLines()
@@ -533,26 +504,55 @@ extension BluetoothManager: CBPeripheralDelegate {
         var firstMessage = true
 
         // Process while buffer contains any newline character
-        while let separatorIndex = receiveBuffer.firstIndex(where: { $0 == "\n" || $0 == "\r" }) {
+        // 0x0A is \n, 0x0D is \r
+        while let separatorIndex = receiveBuffer.firstIndex(where: { $0 == 0x0A || $0 == 0x0D }) {
             // Extract line content (everything before the separator)
-            let line = String(receiveBuffer[..<separatorIndex])
+            let lineData = receiveBuffer.subdata(in: 0..<separatorIndex)
 
-            // Calculate how many characters to remove (line + separator)
-            var removeCount = receiveBuffer.distance(from: receiveBuffer.startIndex, to: separatorIndex) + 1
+            // Calculate how many bytes to remove (line + separator)
+            var removeCount = separatorIndex + 1
 
             // Check for \r\n pair and remove both
-            let afterSeparator = receiveBuffer.index(after: separatorIndex)
-            if receiveBuffer[separatorIndex] == "\r" &&
-               afterSeparator < receiveBuffer.endIndex &&
-               receiveBuffer[afterSeparator] == "\n" {
+            if receiveBuffer[separatorIndex] == 0x0D &&
+               separatorIndex + 1 < receiveBuffer.count &&
+               receiveBuffer[separatorIndex + 1] == 0x0A {
                 removeCount += 1
             }
 
-            // Remove processed characters from buffer
-            receiveBuffer.removeFirst(removeCount)
+            // Remove processed bytes from buffer
+            receiveBuffer.removeSubrange(0..<removeCount)
+
+            // Decode line
+            let decodedLine: String
+            if let str = String(data: lineData, encoding: .utf8) {
+                if settingsManager?.debugMode == true {
+                    print("✅ Decoded Line: \"\(str)\"")
+                }
+                decodedLine = str
+            } else {
+                // Fallback for invalid UTF-8 - filter out non-printable bytes
+                let validBytes = lineData.filter { byte in
+                    // Keep printable ASCII (0x20-0x7E) and common control chars
+                    (byte >= 0x20 && byte <= 0x7E) ||
+                    byte == 0x09 // Tab
+                }
+
+                if let str = String(data: Data(validBytes), encoding: .utf8) {
+                    if settingsManager?.debugMode == true {
+                        print("⚠️ Decoded Filtered Line: \"\(str)\"")
+                    }
+                    decodedLine = str
+                } else {
+                    // Still can't decode - show as hex
+                    decodedLine = lineData.map { String(format: "<%02X>", $0) }.joined()
+                    if settingsManager?.debugMode == true {
+                        print("❌ Binary Line: \(decodedLine)")
+                    }
+                }
+            }
 
             // Skip empty lines
-            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            let trimmed = decodedLine.trimmingCharacters(in: .whitespaces)
             guard !trimmed.isEmpty else { continue }
 
             // Send to terminal
@@ -564,6 +564,14 @@ extension BluetoothManager: CBPeripheralDelegate {
                 playMessageReceivedSound()
                 firstMessage = false
             }
+        }
+
+        // Safety: If buffer grows too large without newlines, clear it to prevent memory issues
+        if receiveBuffer.count > 1024 * 10 { // 10KB limit for a single line
+             receiveBuffer.removeAll()
+             if settingsManager?.debugMode == true {
+                 print("🚨 Buffer cleared due to size limit (no newlines found)")
+             }
         }
     }
 

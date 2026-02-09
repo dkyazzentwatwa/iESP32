@@ -11,6 +11,7 @@ struct TerminalMessageView: View {
     let message: TerminalMessage
     @ObservedObject var settings: SettingsManager
     let lineNumber: Int?
+    var onResend: ((String) -> Void)?
 
     private var timeString: String {
         let formatter = DateFormatter()
@@ -40,7 +41,25 @@ struct TerminalMessageView: View {
     }
 
     private var messageColor: Color {
-        message.direction == .sent ? settings.sentMessageColor : settings.receivedMessageColor
+        if message.direction == .received {
+            let content = message.content.uppercased()
+            if content.contains("ERROR") || content.contains("FATAL") {
+                return .red
+            } else if content.contains("WARN") || content.contains("WARNING") {
+                return .orange
+            } else if content.contains("DEBUG") {
+                return .gray
+            } else if content.contains("INFO") {
+                return .blue
+            }
+        }
+        return message.direction == .sent ? settings.sentMessageColor : settings.receivedMessageColor
+    }
+
+    private var isHighlighted: Bool {
+        guard message.direction == .received else { return false }
+        let content = message.content.uppercased()
+        return content.contains("ERROR") || content.contains("FATAL") || content.contains("WARN") || content.contains("WARNING")
     }
 
     var body: some View {
@@ -65,6 +84,7 @@ struct TerminalMessageView: View {
 
             Text(message.content)
                 .font(.system(size: settings.fontSize, design: .monospaced))
+                .fontWeight(isHighlighted ? .bold : .regular)
                 .foregroundColor(messageColor)
                 .textSelection(.enabled)
                 .lineLimit(settings.textWrapping ? nil : 1)
@@ -78,5 +98,18 @@ struct TerminalMessageView: View {
             Spacer(minLength: 0)
         }
         .padding(.vertical, 2)
+        .contextMenu {
+            Button {
+                UIPasteboard.general.string = message.content
+            } label: {
+                Label("Copy Message", systemImage: "doc.on.doc")
+            }
+
+            Button {
+                onResend?(message.content)
+            } label: {
+                Label("Send Again", systemImage: "paperplane")
+            }
+        }
     }
 }
