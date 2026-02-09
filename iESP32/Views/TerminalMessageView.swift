@@ -11,6 +11,7 @@ struct TerminalMessageView: View {
     let message: TerminalMessage
     @ObservedObject var settings: SettingsManager
     let lineNumber: Int?
+    var onResend: ((String) -> Void)?
 
     private var timeString: String {
         let formatter = DateFormatter()
@@ -78,5 +79,18 @@ struct TerminalMessageView: View {
             Spacer(minLength: 0)
         }
         .padding(.vertical, 2)
+        .contextMenu {
+            Button {
+                UIPasteboard.general.string = message.content
+            } label: {
+                Label("Copy Message", systemImage: "doc.on.doc")
+            }
+
+            Button {
+                onResend?(message.content)
+            } label: {
+                Label("Send Again", systemImage: "paperplane")
+            }
+        }
     }
 }

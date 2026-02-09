@@ -25,6 +25,7 @@ struct ContentView: View {
 
     // Search & Filter State
     @State private var showSearch = false
+    @State private var showMacros = false
     @State private var searchText = ""
     @State private var caseSensitive = false
     @State private var useRegex = false
@@ -93,6 +94,11 @@ struct ContentView: View {
                     }
                 }
                 ToolbarItem(placement: .navigationBarTrailing) {
+                    ShareLink(item: generateExportString()) {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
                     Button(action: { showStats = true }) {
                         Image(systemName: "chart.bar")
                     }
@@ -119,6 +125,9 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showFilters) {
                 FilterOptionsView(filterDirection: $filterDirection, filterTimeRange: $filterTimeRange)
+            }
+            .sheet(isPresented: $showMacros) {
+                MacroListView(bluetoothManager: bluetoothManager)
             }
             .alert(isPresented: $bluetoothManager.showAlert) {
                 Alert(
@@ -249,8 +258,11 @@ struct ContentView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 4) {
                     ForEach(Array((showSearch || filterDirection != nil || filterTimeRange != .allTime ? filteredMessages : displayedMessages).enumerated()), id: \.element.id) { index, message in
-                        TerminalMessageView(message: message, settings: settings, lineNumber: index + 1)
-                            .id(message.id)
+                        TerminalMessageView(message: message, settings: settings, lineNumber: index + 1) { content in
+                            messageText = content
+                            sendMessage()
+                        }
+                        .id(message.id)
                     }
                 }
                 .padding()
@@ -309,6 +321,13 @@ struct ContentView: View {
                     .font(.title2)
             }
             .disabled(messageText.isEmpty || bluetoothManager.connectionState != .connected)
+
+            // Macros button
+            Button(action: { showMacros = true }) {
+                Image(systemName: "list.bullet.rectangle.fill")
+                    .font(.title3)
+            }
+            .buttonStyle(.bordered)
 
             // Clear button
             Button(action: clearTerminal) {
@@ -473,6 +492,51 @@ struct ContentView: View {
     private func navigateToPreviousResult() {
         guard !searchResults.isEmpty else { return }
         currentSearchResult = (currentSearchResult - 1 + searchResults.count) % searchResults.count
+    }
+
+    // MARK: - Export
+    private func generateExportString() -> String {
+        let messagesToExport = filteredMessages
+        guard !messagesToExport.isEmpty else { return "No messages to export" }
+
+        switch settings.exportFormat {
+        case "csv":
+            var csv = "Timestamp,Direction,Device,Content\n"
+            for message in messagesToExport {
+                let device = message.deviceName ?? "None"
+                let content = message.content.replacingOccurrences(of: "\"", with: "\"\"")
+                csv += "\(message.timestamp),\(message.direction.rawValue),\(device),\"\(content)\"\n"
+            }
+            return csv
+
+        case "json":
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = .prettyPrinted
+            encoder.dateEncodingStrategy = .iso8601
+
+            struct MessageDTO: Codable {
+                let timestamp: Date
+                let content: String
+                let direction: String
+                let deviceName: String?
+            }
+
+            let dtos = messagesToExport.map { MessageDTO(timestamp: $0.timestamp, content: $0.content, direction: $0.direction.rawValue, deviceName: $0.deviceName) }
+            if let data = try? encoder.encode(dtos), let str = String(data: data, encoding: .utf8) {
+                return str
+            }
+            return "Error generating JSON"
+
+        default: // "text"
+            var text = "--- iESP32 Terminal Log ---\n"
+            text += "Exported on: \(Date())\n\n"
+            for message in messagesToExport {
+                let timestamp = "[\(message.timestamp)] "
+                let direction = message.direction == .sent ? ">> " : "<< "
+                text += "\(timestamp)\(direction)\(message.content)\n"
+            }
+            return text
+        }
     }
 }
 
