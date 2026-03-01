@@ -9,6 +9,10 @@ import SwiftUI
 
 struct SettingsView: View {
     @ObservedObject var settings: SettingsManager
+    @ObservedObject var bluetoothManager: BluetoothManager
+    let onExportRequested: () -> Void
+    let onDiagnosticsExportRequested: () -> Void
+    let onClearDiagnosticsRequested: () -> Void
     @Environment(\.dismiss) var dismiss
     @State private var showResetAlert = false
 
@@ -79,13 +83,22 @@ struct SettingsView: View {
                     }
 
                     Toggle("Auto-export on disconnect", isOn: $settings.autoExportOnDisconnect)
+
+                    Button("Export Terminal Now") {
+                        onExportRequested()
+                    }
                 } header: {
                     Text("Data Management")
                 }
 
                 // Developer Options Section
                 Section {
-                    NavigationLink(destination: AdvancedSettingsView(settings: settings)) {
+                    NavigationLink(destination: AdvancedSettingsView(
+                        settings: settings,
+                        bluetoothManager: bluetoothManager,
+                        onExportDebugLog: onDiagnosticsExportRequested,
+                        onClearDiagnostics: onClearDiagnosticsRequested
+                    )) {
                         Label("Advanced & Developer", systemImage: "wrench.and.screwdriver.fill")
                     }
                 } header: {

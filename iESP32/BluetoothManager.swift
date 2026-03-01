@@ -57,12 +57,19 @@ class BluetoothManager: NSObject, ObservableObject {
     // MARK: - Published Properties
     @Published var discoveredDevices: [CBPeripheral] = []
     @Published var connectedDevice: CBPeripheral?
-    @Published var connectionState: ConnectionState = .disconnected
+    @Published var connectionState: ConnectionState = .disconnected {
+        didSet {
+            onConnectionStateChanged?(connectionState)
+        }
+    }
     @Published var isScanning = false
     @Published var bluetoothState: CBManagerState = .unknown
     @Published var showAlert = false
     @Published var alertMessage = ""
     @Published var deviceRSSI: [UUID: Int] = [:] // Store RSSI for discovered devices
+    @Published var bleEventLog: [BLEEvent] = []
+    @Published var rawPackets: [RawPacket] = []
+    @Published var isTransportReady = false
 
     // MARK: - Stats Properties
     @Published var rssiValue: Int = 0
@@ -81,6 +88,7 @@ class BluetoothManager: NSObject, ObservableObject {
     private var centralManager: CBCentralManager!
     private var txCharacteristic: CBCharacteristic?
     private var rxCharacteristic: CBCharacteristic?
+    private var txWriteType: CBCharacteristicWriteType = .withResponse
     private var connectionTimer: Timer?
     private var rssiTimer: Timer?
     private var durationTimer: Timer?
@@ -90,6 +98,7 @@ class BluetoothManager: NSObject, ObservableObject {
 
     // Message buffering for incoming data
     private var receiveBuffer: String = ""
+    private var partialLineFlushWorkItem: DispatchWorkItem?
 
     // Nordic UART Service UUIDs (nonisolated - these are constants)
     nonisolated(unsafe) private let nordicUARTServiceUUID = CBUUID(string: "6E400001-B5A3-F393-E0A9-E50E24DCCA9E")
@@ -98,12 +107,18 @@ class BluetoothManager: NSObject, ObservableObject {
 
     // Callback for received messages
     var onMessageReceived: ((String) -> Void)?
+    var onMessageDeliveryStatusChanged: ((UUID, MessageDeliveryStatus) -> Void)?
+    var onBluetoothPoweredOn: (() -> Void)?
+    var onConnectionStateChanged: ((ConnectionState) -> Void)?
 
     // Settings Manager
     weak var settingsManager: SettingsManager?
 
     // Track manual disconnect to prevent auto-reconnect
     private var wasManualDisconnect = false
+    private var pendingSentMessageIDs: [UUID] = []
+    private let maxStoredEvents = 1000
+    private let maxStoredPackets = 1000
 
     // MARK: - Initialization
     override init() {
@@ -115,6 +130,7 @@ class BluetoothManager: NSObject, ObservableObject {
     func startScanning() {
         guard centralManager.state == .poweredOn else {
             showAlert(message: "Bluetooth is not powered on. Please enable Bluetooth in Settings.")
+            appendEvent(level: "warn", "Scan requested while bluetooth is not powered on")
             return
         }
 
@@ -122,6 +138,7 @@ class BluetoothManager: NSObject, ObservableObject {
         deviceRSSI.removeAll() // Clear RSSI values
         isScanning = true
         connectionState = .scanning
+        appendEvent("Started scanning for peripherals")
         centralManager.scanForPeripherals(withServices: [nordicUARTServiceUUID], options: [CBCentralManagerScanOptionAllowDuplicatesKey: false])
 
         // Auto-stop scanning (use setting or default to 10 seconds)
@@ -135,6 +152,7 @@ class BluetoothManager: NSObject, ObservableObject {
         guard isScanning else { return }
         centralManager.stopScan()
         isScanning = false
+        appendEvent("Stopped scanning")
         if connectionState == .scanning {
             connectionState = .disconnected
         }
@@ -145,6 +163,7 @@ class BluetoothManager: NSObject, ObservableObject {
         connectionState = .connecting
         connectedDevice = peripheral
         peripheral.delegate = self
+        appendEvent("Connecting to \(peripheral.name ?? "Unknown")")
         centralManager.connect(peripheral, options: nil)
 
         // Connection timeout (use setting or default to 10 seconds)
@@ -159,30 +178,59 @@ class BluetoothManager: NSObject, ObservableObject {
     func disconnect() {
         guard let peripheral = connectedDevice else { return }
         wasManualDisconnect = true
+        appendEvent("Manual disconnect requested for \(peripheral.name ?? "Unknown")")
         centralManager.cancelPeripheralConnection(peripheral)
         resetConnection()
     }
 
-    func sendMessage(_ message: String) {
+    @discardableResult
+    func sendMessage(_ message: String, messageID: UUID? = nil) -> Bool {
+        guard isTransportReady else {
+            showAlert(message: "Connection is not ready yet. Please wait a moment and try again.")
+            appendEvent(level: "warn", "TX attempted before transport ready")
+            if let messageID {
+                onMessageDeliveryStatusChanged?(messageID, .failed)
+            }
+            return false
+        }
+
         guard let txCharacteristic = txCharacteristic,
               let connectedDevice = connectedDevice else {
             showAlert(message: "Cannot send message. Not connected or invalid message.")
-            return
+            appendEvent(level: "error", "TX failed: missing connection or characteristic")
+            if let messageID {
+                onMessageDeliveryStatusChanged?(messageID, .failed)
+            }
+            return false
         }
 
         // Add newline terminator for ESP32 UART commands
         let messageWithNewline = message + "\n"
         guard let data = messageWithNewline.data(using: .utf8) else {
             showAlert(message: "Cannot encode message.")
-            return
+            appendEvent(level: "error", "TX failed: utf8 encoding error")
+            if let messageID {
+                onMessageDeliveryStatusChanged?(messageID, .failed)
+            }
+            return false
         }
 
-        connectedDevice.writeValue(data, for: txCharacteristic, type: .withResponse)
+        if let messageID {
+            pendingSentMessageIDs.append(messageID)
+        }
+        connectedDevice.writeValue(data, for: txCharacteristic, type: txWriteType)
+        appendEvent("TX \(data.count) bytes")
+        appendRawPacket(direction: .tx, payload: data)
 
         // Update stats
         bytesSent += data.count
         messagesSent += 1
         bytesInLastSecond += data.count
+        if txWriteType == .withoutResponse, let messageID {
+            onMessageDeliveryStatusChanged?(messageID, .delivered)
+            pendingSentMessageIDs.removeAll { $0 == messageID }
+        }
+        return true
     }
 
     // MARK: - Stats Methods
@@ -282,6 +330,7 @@ class BluetoothManager: NSObject, ObservableObject {
         }
 
         showAlert(message: "Connection failed. Device may be out of range.")
+        appendEvent(level: "error", "Connection timeout")
         resetConnection()
     }
 
@@ -289,11 +338,18 @@ class BluetoothManager: NSObject, ObservableObject {
         connectionTimer?.invalidate()
         connectionTimer = nil
         stopMonitoring()
-        resetStats()
         txCharacteristic = nil
         rxCharacteristic = nil
+        isTransportReady = false
         connectedDevice = nil
         connectionState = .disconnected
+        resetStats()
+        partialLineFlushWorkItem?.cancel()
+        partialLineFlushWorkItem = nil
+        for messageID in pendingSentMessageIDs {
+            onMessageDeliveryStatusChanged?(messageID, .failed)
+        }
+        pendingSentMessageIDs.removeAll()
 
         // Clear receive buffer
         receiveBuffer = ""
@@ -302,6 +358,30 @@ class BluetoothManager: NSObject, ObservableObject {
     private func showAlert(message: String) {
         alertMessage = message
         showAlert = true
+    }
+
+    private func appendEvent(level: String = "info", _ message: String) {
+        let shouldStore = settingsManager?.logAllBLEEvents == true || settingsManager?.debugMode == true
+        guard shouldStore else { return }
+
+        bleEventLog.append(BLEEvent(level: level, message: message))
+        if bleEventLog.count > maxStoredEvents {
+            bleEventLog.removeFirst(bleEventLog.count - maxStoredEvents)
+        }
+    }
+
+    private func appendRawPacket(direction: RawPacket.Direction, payload: Data) {
+        guard settingsManager?.showRawDataPackets == true else { return }
+
+        rawPackets.append(RawPacket(direction: direction, payload: payload))
+        if rawPackets.count > maxStoredPackets {
+            rawPackets.removeFirst(rawPackets.count - maxStoredPackets)
+        }
+    }
+
+    func clearDiagnostics() {
+        bleEventLog.removeAll()
+        rawPackets.removeAll()
     }
 
     // MARK: - Sound & Haptic Feedback
@@ -327,6 +407,7 @@ extension BluetoothManager: CBCentralManagerDelegate {
     nonisolated func centralManagerDidUpdateState(_ central: CBCentralManager) {
         Task { @MainActor in
             bluetoothState = central.state
+            appendEvent("Bluetooth state updated: \(central.state.rawValue)")
 
             switch central.state {
             case .poweredOff:
@@ -337,6 +418,7 @@ extension BluetoothManager: CBCentralManagerDelegate {
             case .unsupported:
                 showAlert(message: "Bluetooth Low Energy is not supported on this device.")
             case .poweredOn:
+                onBluetoothPoweredOn?()
                 break
             default:
                 break
@@ -348,6 +430,7 @@ extension BluetoothManager: CBCentralManagerDelegate {
         Task { @MainActor in
             if !discoveredDevices.contains(where: { $0.identifier == peripheral.identifier }) {
                 discoveredDevices.append(peripheral)
+                appendEvent("Discovered \(peripheral.name ?? "Unknown") RSSI \(RSSI.intValue)")
             }
             // Store RSSI value for this device
             deviceRSSI[peripheral.identifier] = RSSI.intValue
@@ -359,8 +442,10 @@ extension BluetoothManager: CBCentralManagerDelegate {
             connectionTimer?.invalidate()
             connectionTimer = nil
             connectionState = .connected
+            isTransportReady = false
             startMonitoring()
             peripheral.discoverServices([nordicUARTServiceUUID])
+            appendEvent("Connected to \(peripheral.name ?? "Unknown")")
 
             // Save last connected device if enabled
             if settingsManager?.rememberLastDevice == true {
@@ -380,6 +465,7 @@ extension BluetoothManager: CBCentralManagerDelegate {
         Task { @MainActor in
             let errorMessage = error?.localizedDescription ?? "Unknown error"
             showAlert(message: "Failed to connect: \(errorMessage)")
+            appendEvent(level: "error", "Failed to connect: \(errorMessage)")
             resetConnection()
         }
     }
@@ -391,19 +477,25 @@ extension BluetoothManager: CBCentralManagerDelegate {
             if shouldShowAlert {
                 if let error = error {
                     showAlert(message: "Connection lost: \(error.localizedDescription)")
+                    appendEvent(level: "warn", "Disconnected with error: \(error.localizedDescription)")
                 } else {
                     showAlert(message: "Disconnected from \(peripheral.name ?? "device")")
+                    appendEvent("Disconnected from \(peripheral.name ?? "Unknown")")
                 }
             }
 
             // Attempt auto-reconnect if enabled and not a manual disconnect
             let shouldAutoReconnect = settingsManager?.autoReconnect ?? false
-            if shouldAutoReconnect && !wasManualDisconnect {
+            let shouldReconnect = shouldAutoReconnect && !wasManualDisconnect
+
+            // Always emit a disconnected transition so session close/export can run.
+            resetConnection()
+
+            if shouldReconnect {
                 // Wait 2 seconds before attempting reconnect
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
+                appendEvent("Auto-reconnect attempt")
                 connect(to: peripheral)
-            } else {
-                resetConnection()
             }
 
             // Reset manual disconnect flag
@@ -418,6 +510,7 @@ extension BluetoothManager: CBPeripheralDelegate {
         Task { @MainActor in
             if let error = error {
                 showAlert(message: "Error discovering services: \(error.localizedDescription)")
+                appendEvent(level: "error", "Service discovery error: \(error.localizedDescription)")
                 return
             }
 
@@ -433,21 +526,46 @@ extension BluetoothManager: CBPeripheralDelegate {
         Task { @MainActor in
             if let error = error {
                 showAlert(message: "Error discovering characteristics: \(error.localizedDescription)")
+                appendEvent(level: "error", "Characteristic discovery error: \(error.localizedDescription)")
                 return
             }
 
             guard let characteristics = service.characteristics else { return }
 
+            var didSetTX = false
+            var didSetRX = false
+
             for characteristic in characteristics {
                 switch characteristic.uuid {
                 case txCharacteristicUUID:
                     txCharacteristic = characteristic
+                    if characteristic.properties.contains(.writeWithoutResponse) {
+                        txWriteType = .withoutResponse
+                    } else if characteristic.properties.contains(.write) {
+                        txWriteType = .withResponse
+                    } else {
+                        showAlert(message: "TX characteristic does not support writing.")
+                        appendEvent(level: "error", "TX characteristic missing write properties")
+                    }
+                    didSetTX = true
+                    appendEvent("TX characteristic ready")
                 case rxCharacteristicUUID:
                     rxCharacteristic = characteristic
-                    peripheral.setNotifyValue(true, for: characteristic)
+                    if characteristic.properties.contains(.notify) || characteristic.properties.contains(.indicate) {
+                        peripheral.setNotifyValue(true, for: characteristic)
+                    } else {
+                        showAlert(message: "RX characteristic does not support notifications.")
+                        appendEvent(level: "error", "RX characteristic missing notify/indicate")
+                    }
+                    didSetRX = true
+                    appendEvent("RX characteristic ready with notifications enabled")
                 default:
                     break
                 }
+            }
+
+            if !didSetTX || !didSetRX {
+                appendEvent(level: "warn", "UART characteristics incomplete (tx: \(didSetTX), rx: \(didSetRX))")
             }
         }
     }
@@ -485,6 +603,7 @@ extension BluetoothManager: CBPeripheralDelegate {
         // Update stats
         bytesReceived += data.count
         bytesInLastSecond += data.count
+        appendRawPacket(direction: .rx, payload: data)
 
         // DEBUG: Log raw bytes (enabled via settings)
         if settingsManager?.debugMode == true {
@@ -526,6 +645,7 @@ extension BluetoothManager: CBPeripheralDelegate {
 
         // Process complete lines
         processCompleteLines()
+        schedulePartialLineFlush()
     }
 
     private func processCompleteLines() {
@@ -567,10 +687,43 @@ extension BluetoothManager: CBPeripheralDelegate {
         }
     }
 
+    private func schedulePartialLineFlush() {
+        partialLineFlushWorkItem?.cancel()
+        let flushTask = DispatchWorkItem { [weak self] in
+            self?.flushPartialBufferIfNeeded()
+        }
+        partialLineFlushWorkItem = flushTask
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: flushTask)
+    }
+
+    private func flushPartialBufferIfNeeded() {
+        guard !receiveBuffer.isEmpty else { return }
+
+        let buffered = receiveBuffer
+        receiveBuffer = ""
+        partialLineFlushWorkItem = nil
+
+        messagesReceived += 1
+        onMessageReceived?(buffered)
+        playMessageReceivedSound()
+        appendEvent("Flushed non-terminated RX chunk (\(buffered.utf8.count) bytes)")
+    }
+
     nonisolated func peripheral(_ peripheral: CBPeripheral, didWriteValueFor characteristic: CBCharacteristic, error: Error?) {
         Task { @MainActor in
+            let sentMessageID = pendingSentMessageIDs.isEmpty ? nil : pendingSentMessageIDs.removeFirst()
             if let error = error {
                 showAlert(message: "Failed to send message: \(error.localizedDescription)")
+                appendEvent(level: "error", "TX write error: \(error.localizedDescription)")
+                if let sentMessageID {
+                    onMessageDeliveryStatusChanged?(sentMessageID, .failed)
+                }
+                return
+            }
+
+            appendEvent("TX write acknowledged")
+            if let sentMessageID {
+                onMessageDeliveryStatusChanged?(sentMessageID, .delivered)
             }
         }
     }
@@ -588,6 +741,22 @@ extension BluetoothManager: CBPeripheralDelegate {
             if rssiHistory.count > 60 {
                 rssiHistory.removeFirst()
             }
+        }
+    }
+
+    nonisolated func peripheral(_ peripheral: CBPeripheral, didUpdateNotificationStateFor characteristic: CBCharacteristic, error: Error?) {
+        Task { @MainActor in
+            guard characteristic.uuid == rxCharacteristicUUID else { return }
+
+            if let error {
+                isTransportReady = false
+                showAlert(message: "Failed to enable RX notifications: \(error.localizedDescription)")
+                appendEvent(level: "error", "RX notify enable failed: \(error.localizedDescription)")
+                return
+            }
+
+            isTransportReady = characteristic.isNotifying && txCharacteristic != nil
+            appendEvent("RX notifications active: \(characteristic.isNotifying)")
         }
     }
 }

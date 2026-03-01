@@ -11,6 +11,7 @@ struct TerminalMessageView: View {
     let message: TerminalMessage
     @ObservedObject var settings: SettingsManager
     let lineNumber: Int?
+    let isHighlighted: Bool
 
     private var timeString: String {
         let formatter = DateFormatter()
@@ -41,6 +42,30 @@ struct TerminalMessageView: View {
 
     private var messageColor: Color {
         message.direction == .sent ? settings.sentMessageColor : settings.receivedMessageColor
+    }
+
+    private var statusText: String? {
+        guard message.direction == .sent, let status = message.deliveryStatus else { return nil }
+        switch status {
+        case .pending:
+            return "sending"
+        case .delivered:
+            return "sent"
+        case .failed:
+            return "failed"
+        }
+    }
+
+    private var statusColor: Color {
+        guard let status = message.deliveryStatus else { return .secondary }
+        switch status {
+        case .pending:
+            return .orange
+        case .delivered:
+            return .green
+        case .failed:
+            return .red
+        }
     }
 
     var body: some View {
@@ -75,8 +100,17 @@ struct TerminalMessageView: View {
                     .foregroundColor(.secondary)
             }
 
+            if let statusText {
+                Text("[\(statusText)]")
+                    .font(.system(size: settings.fontSize * 0.65, design: .monospaced))
+                    .foregroundColor(statusColor)
+            }
+
             Spacer(minLength: 0)
         }
         .padding(.vertical, 2)
+        .padding(.horizontal, 4)
+        .background(isHighlighted ? Color.yellow.opacity(0.2) : Color.clear)
+        .cornerRadius(4)
     }
 }

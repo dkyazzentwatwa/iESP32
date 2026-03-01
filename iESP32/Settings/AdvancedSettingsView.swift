@@ -9,6 +9,9 @@ import SwiftUI
 
 struct AdvancedSettingsView: View {
     @ObservedObject var settings: SettingsManager
+    @ObservedObject var bluetoothManager: BluetoothManager
+    let onExportDebugLog: () -> Void
+    let onClearDiagnostics: () -> Void
 
     var body: some View {
         Form {
@@ -60,18 +63,45 @@ struct AdvancedSettingsView: View {
             // Debug Actions
             if settings.debugMode {
                 Section {
-                    Button("Clear All User Defaults") {
-                        clearUserDefaults()
+                    Button("Export Debug Log") {
+                        onExportDebugLog()
+                    }
+
+                    Button("Clear BLE Diagnostics Buffer") {
+                        onClearDiagnostics()
                     }
                     .foregroundColor(.orange)
 
-                    Button("Export Debug Log") {
-                        // TODO: Implement debug log export
+                    Button("Clear All User Defaults") {
+                        clearUserDefaults()
                     }
+                    .foregroundColor(.red)
                 } header: {
                     Text("Debug Actions")
                 } footer: {
                     Text("⚠️ Debug actions are only visible when Debug Mode is enabled")
+                }
+            }
+
+            if settings.debugMode {
+                Section {
+                    HStack {
+                        Text("BLE Event Count")
+                        Spacer()
+                        Text("\\(bluetoothManager.bleEventLog.count)")
+                            .foregroundColor(.secondary)
+                    }
+
+                    HStack {
+                        Text("Raw Packet Count")
+                        Spacer()
+                        Text("\\(bluetoothManager.rawPackets.count)")
+                            .foregroundColor(.secondary)
+                    }
+                } header: {
+                    Text("Runtime Diagnostics")
+                } footer: {
+                    Text("Event and packet buffers are in-memory and reset when the app restarts.")
                 }
             }
         }

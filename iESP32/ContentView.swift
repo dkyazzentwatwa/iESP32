@@ -9,6 +9,11 @@ import SwiftUI
 import SwiftData
 import CoreBluetooth
 
+private struct ExportShareItem: Identifiable {
+    let id = UUID()
+    let url: URL
+}
+
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Query(sort: \TerminalMessage.timestamp, order: .forward) private var messages: [TerminalMessage]
@@ -21,6 +26,12 @@ struct ContentView: View {
     @State private var showStats = false
     @State private var commandHistory: [String] = []
     @State private var historyIndex: Int?
+    @State private var currentSession: ConnectionSession?
+    @State private var pendingAutoConnect = false
+    @State private var autoConnectTask: Task<Void, Never>?
+    @State private var showAppAlert = false
+    @State private var appAlertMessage = ""
+    @State private var shareItem: ExportShareItem?
     @FocusState private var isTextFieldFocused: Bool
 
     // Search & Filter State
@@ -32,6 +43,7 @@ struct ContentView: View {
     @State private var filterTimeRange: TimeRange = .allTime
     @State private var showFilters = false
     @State private var currentSearchResult = 0
+    @State private var selectedSearchMessageID: PersistentIdentifier?
 
     init() {
         // Inject settings manager into bluetooth manager
@@ -46,7 +58,6 @@ struct ContentView: View {
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
-                // Search Bar (conditional)
                 if showSearch {
                     SearchBarView(
                         searchText: $searchText,
@@ -59,26 +70,22 @@ struct ContentView: View {
                         onNext: navigateToNextResult
                     )
                     .transition(.move(edge: .top).combined(with: .opacity))
-
-                    // Active filters chips
-                    if filterDirection != nil || filterTimeRange != .allTime {
-                        activeFiltersView
-                    }
                 }
 
-                // Connection Bar
+                if filterDirection != nil || filterTimeRange != .allTime {
+                    activeFiltersView
+                }
+
                 connectionBar
                     .padding()
                     .background(Color(uiColor: .systemBackground))
 
                 Divider()
 
-                // Terminal display
                 terminalView
 
                 Divider()
 
-                // Input area
                 inputArea
                     .padding()
                     .background(Color(uiColor: .systemBackground))
@@ -88,7 +95,7 @@ struct ContentView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarLeading) {
-                    Button(action: { withAnimation { showSearch.toggle() } }) {
+                    Button(action: toggleSearch) {
                         Image(systemName: showSearch ? "xmark" : "magnifyingglass")
                     }
                 }
@@ -104,15 +111,50 @@ struct ContentView: View {
                 }
             }
             .onAppear {
-                setupBluetoothCallback()
+                configureCallbacks()
                 loadCommandHistory()
                 attemptAutoConnect()
+            }
+            .onDisappear {
+                autoConnectTask?.cancel()
+            }
+            .onChange(of: bluetoothManager.bluetoothState) { _, newState in
+                if newState == .poweredOn {
+                    attemptAutoConnectIfReady()
+                }
+            }
+            .onChange(of: searchText) { _, _ in
+                refreshSearchSelection()
+            }
+            .onChange(of: caseSensitive) { _, _ in
+                refreshSearchSelection()
+            }
+            .onChange(of: useRegex) { _, _ in
+                refreshSearchSelection()
+            }
+            .onChange(of: filterDirection) { _, _ in
+                refreshSearchSelection()
+            }
+            .onChange(of: filterTimeRange) { _, _ in
+                refreshSearchSelection()
             }
             .sheet(isPresented: $showDevicePicker) {
                 DevicePickerView(bluetoothManager: bluetoothManager, settings: settings)
             }
             .sheet(isPresented: $showSettings) {
-                SettingsView(settings: settings)
+                SettingsView(
+                    settings: settings,
+                    bluetoothManager: bluetoothManager,
+                    onExportRequested: { exportMessages(reason: "manual", presentShareSheet: true) },
+                    onDiagnosticsExportRequested: { exportDiagnostics(presentShareSheet: true) },
+                    onClearDiagnosticsRequested: {
+                        bluetoothManager.clearDiagnostics()
+                        showAppMessage("Cleared in-memory diagnostics logs.")
+                    }
+                )
+            }
+            .sheet(item: $shareItem) { item in
+                ShareSheetView(activityItems: [item.url])
             }
             .sheet(isPresented: $showStats) {
                 ConnectionStatsView(bluetoothManager: bluetoothManager)
@@ -127,6 +169,11 @@ struct ContentView: View {
                     dismissButton: .default(Text("OK"))
                 )
             }
+            .alert("iESP32", isPresented: $showAppAlert) {
+                Button("OK", role: .cancel) { }
+            } message: {
+                Text(appAlertMessage)
+            }
             .preferredColorScheme(themeColorScheme)
         }
     }
@@ -139,7 +186,7 @@ struct ContentView: View {
         case "dark":
             return .dark
         default:
-            return nil // System default
+            return nil
         }
     }
 
@@ -213,6 +260,9 @@ struct ContentView: View {
         case .connecting:
             return "Connecting..."
         case .connected:
+            if !bluetoothManager.isTransportReady {
+                return "Initializing..."
+            }
             if let device = bluetoothManager.connectedDevice {
                 return "Disconnect (\(device.name ?? "Unknown"))"
             }
@@ -235,7 +285,6 @@ struct ContentView: View {
         if bluetoothManager.connectionState == .connected {
             bluetoothManager.disconnect()
         } else if bluetoothManager.connectionState == .disconnected {
-            // Clear terminal if setting is enabled
             if settings.clearOnConnect {
                 clearTerminal()
             }
@@ -248,24 +297,34 @@ struct ContentView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 4) {
-                    ForEach(Array((showSearch || filterDirection != nil || filterTimeRange != .allTime ? filteredMessages : displayedMessages).enumerated()), id: \.element.id) { index, message in
-                        TerminalMessageView(message: message, settings: settings, lineNumber: index + 1)
-                            .id(message.id)
+                    ForEach(Array(visibleMessages.enumerated()), id: \.element.id) { index, message in
+                        TerminalMessageView(
+                            message: message,
+                            settings: settings,
+                            lineNumber: index + 1,
+                            isHighlighted: message.id == selectedSearchMessageID
+                        )
+                        .id(message.id)
                     }
                 }
                 .padding()
             }
             .onChange(of: messages.count) { _, _ in
-                if settings.autoScroll, let lastMessage = messages.last {
+                if settings.autoScroll, let lastMessage = visibleMessages.last {
                     withAnimation {
                         proxy.scrollTo(lastMessage.id, anchor: .bottom)
                     }
                 }
             }
+            .onChange(of: selectedSearchMessageID) { _, newID in
+                guard let newID else { return }
+                withAnimation {
+                    proxy.scrollTo(newID, anchor: .center)
+                }
+            }
         }
     }
 
-    // Apply message buffer size limit
     private var displayedMessages: [TerminalMessage] {
         guard settings.messageBufferSize > 0 else { return messages }
         let count = messages.count
@@ -273,10 +332,35 @@ struct ContentView: View {
         return count > bufferSize ? Array(messages.suffix(bufferSize)) : messages
     }
 
+    private var baseFilteredMessages: [TerminalMessage] {
+        var filtered = displayedMessages
+
+        if let direction = filterDirection {
+            filtered = filtered.filter { $0.direction == direction }
+        }
+
+        filtered = filtered.filter { message in
+            filterTimeRange.contains(message.timestamp)
+        }
+
+        return filtered
+    }
+
+    private var visibleMessages: [TerminalMessage] {
+        if !searchText.isEmpty {
+            return searchResults
+        }
+
+        if showSearch || filterDirection != nil || filterTimeRange != .allTime {
+            return baseFilteredMessages
+        }
+
+        return displayedMessages
+    }
+
     // MARK: - Input Area
     private var inputArea: some View {
         HStack(spacing: 12) {
-            // Command history buttons
             VStack(spacing: 4) {
                 Button(action: navigateHistoryUp) {
                     Image(systemName: "chevron.up")
@@ -294,7 +378,6 @@ struct ContentView: View {
             }
             .buttonStyle(.bordered)
 
-            // Text field
             TextField("Enter command...", text: $messageText)
                 .textFieldStyle(.roundedBorder)
                 .font(.system(.body, design: .monospaced))
@@ -303,14 +386,12 @@ struct ContentView: View {
                     sendMessage()
                 }
 
-            // Send button
             Button(action: sendMessage) {
                 Image(systemName: "arrow.up.circle.fill")
                     .font(.title2)
             }
-            .disabled(messageText.isEmpty || bluetoothManager.connectionState != .connected)
+            .disabled(messageText.isEmpty || bluetoothManager.connectionState != .connected || !bluetoothManager.isTransportReady)
 
-            // Clear button
             Button(action: clearTerminal) {
                 Image(systemName: "trash")
                     .font(.title3)
@@ -324,21 +405,23 @@ struct ContentView: View {
     private func sendMessage() {
         guard !messageText.isEmpty else { return }
 
-        // Send via Bluetooth
-        bluetoothManager.sendMessage(messageText)
-
-        // Save to history
         let message = TerminalMessage(
             content: messageText,
             direction: .sent,
-            deviceName: bluetoothManager.connectedDevice?.name
+            deviceName: bluetoothManager.connectedDevice?.name,
+            sessionID: currentSession?.sessionID,
+            deliveryStatus: .pending
         )
         modelContext.insert(message)
 
-        // Add to command history
-        addToCommandHistory(messageText)
+        let sent = bluetoothManager.sendMessage(messageText, messageID: message.messageID)
+        if !sent {
+            message.deliveryStatus = .failed
+        }
 
-        // Clear input
+        addToCommandHistory(messageText)
+        enforceMessageRetentionLimit()
+
         messageText = ""
         historyIndex = nil
     }
@@ -347,37 +430,230 @@ struct ContentView: View {
         for message in messages {
             modelContext.delete(message)
         }
+        selectedSearchMessageID = nil
     }
 
-    private func setupBluetoothCallback() {
+    private func configureCallbacks() {
         bluetoothManager.onMessageReceived = { receivedMessage in
             let message = TerminalMessage(
                 content: receivedMessage,
                 direction: .received,
-                deviceName: bluetoothManager.connectedDevice?.name
+                deviceName: bluetoothManager.connectedDevice?.name,
+                sessionID: currentSession?.sessionID
             )
             modelContext.insert(message)
+            enforceMessageRetentionLimit()
+        }
+
+        bluetoothManager.onMessageDeliveryStatusChanged = { messageID, status in
+            updateDeliveryStatus(messageID: messageID, status: status)
+        }
+
+        bluetoothManager.onConnectionStateChanged = { newState in
+            handleConnectionStateChange(newState)
+        }
+    }
+
+    private func message(with messageID: UUID) -> TerminalMessage? {
+        var descriptor = FetchDescriptor<TerminalMessage>(
+            predicate: #Predicate<TerminalMessage> { message in
+                message.messageID == messageID
+            }
+        )
+        descriptor.fetchLimit = 1
+        return try? modelContext.fetch(descriptor).first
+    }
+
+    private func updateDeliveryStatus(
+        messageID: UUID,
+        status: MessageDeliveryStatus,
+        retriesRemaining: Int = 1
+    ) {
+        if let matchingMessage = message(with: messageID) {
+            matchingMessage.deliveryStatus = status
+            return
+        }
+
+        guard retriesRemaining > 0 else { return }
+
+        DispatchQueue.main.async {
+            updateDeliveryStatus(
+                messageID: messageID,
+                status: status,
+                retriesRemaining: retriesRemaining - 1
+            )
         }
     }
 
     private func attemptAutoConnect() {
-        // Check if remember last device is enabled
-        guard settings.rememberLastDevice else { return }
-        guard !settings.lastDeviceUUID.isEmpty else { return }
-        guard bluetoothManager.bluetoothState == .poweredOn else { return }
+        guard settings.rememberLastDevice else {
+            pendingAutoConnect = false
+            return
+        }
+        guard !settings.lastDeviceUUID.isEmpty else {
+            pendingAutoConnect = false
+            return
+        }
 
-        // Start scanning to find the remembered device
+        pendingAutoConnect = true
+        attemptAutoConnectIfReady()
+    }
+
+    private func attemptAutoConnectIfReady() {
+        guard pendingAutoConnect else { return }
+        guard bluetoothManager.bluetoothState == .poweredOn else { return }
+        guard bluetoothManager.connectionState == .disconnected else {
+            pendingAutoConnect = false
+            return
+        }
+
+        autoConnectTask?.cancel()
         bluetoothManager.startScanning()
 
-        // Wait a bit for scan results, then check for the remembered device
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) {
-            // Look for the remembered device in discovered devices
-            if let rememberedDevice = self.bluetoothManager.discoveredDevices.first(where: {
-                $0.identifier.uuidString == self.settings.lastDeviceUUID
-            }) {
-                // Found it! Connect automatically
-                self.bluetoothManager.connect(to: rememberedDevice)
+        autoConnectTask = Task { @MainActor in
+            let timeout = Date().addingTimeInterval(Double(max(settings.scanDuration, 5)))
+
+            while Date() < timeout, !Task.isCancelled, pendingAutoConnect {
+                if let rememberedDevice = bluetoothManager.discoveredDevices.first(where: {
+                    $0.identifier.uuidString == settings.lastDeviceUUID
+                }) {
+                    pendingAutoConnect = false
+                    bluetoothManager.connect(to: rememberedDevice)
+                    return
+                }
+
+                try? await Task.sleep(nanoseconds: 300_000_000)
             }
+
+            pendingAutoConnect = false
+        }
+    }
+
+    private func handleConnectionStateChange(_ newState: ConnectionState) {
+        switch newState {
+        case .connected:
+            guard currentSession == nil else { return }
+            guard let connectedDevice = bluetoothManager.connectedDevice else { return }
+
+            let session = ConnectionSession(
+                deviceName: connectedDevice.name ?? "Unknown",
+                deviceUUID: connectedDevice.identifier.uuidString
+            )
+            modelContext.insert(session)
+            currentSession = session
+
+        case .disconnected:
+            closeCurrentSessionAndExportIfNeeded()
+
+        case .connecting, .scanning:
+            break
+        }
+    }
+
+    private func closeCurrentSessionAndExportIfNeeded() {
+        guard let currentSession else { return }
+
+        currentSession.close(
+            bytesSent: bluetoothManager.bytesSent,
+            bytesReceived: bluetoothManager.bytesReceived,
+            messagesSent: bluetoothManager.messagesSent,
+            messagesReceived: bluetoothManager.messagesReceived
+        )
+
+        let sessionID = currentSession.sessionID
+        self.currentSession = nil
+
+        if settings.autoExportOnDisconnect {
+            let sessionMessages = messages(for: sessionID)
+            exportMessages(reason: "disconnect", customMessages: sessionMessages, presentShareSheet: false)
+        }
+    }
+
+    private func messages(for sessionID: UUID) -> [TerminalMessage] {
+        let descriptor = FetchDescriptor<TerminalMessage>(
+            predicate: #Predicate<TerminalMessage> { message in
+                message.sessionID == sessionID
+            },
+            sortBy: [SortDescriptor(\.timestamp, order: .forward)]
+        )
+        return (try? modelContext.fetch(descriptor)) ?? []
+    }
+
+    private func enforceMessageRetentionLimit() {
+        guard settings.messageBufferSize > 0 else { return }
+        let overflow = messages.count - settings.messageBufferSize
+        guard overflow > 0 else { return }
+
+        for message in messages.prefix(overflow) {
+            modelContext.delete(message)
+        }
+    }
+
+    private func showAppMessage(_ message: String) {
+        appAlertMessage = message
+        showAppAlert = true
+    }
+
+    private func exportMessages(
+        reason: String,
+        customMessages: [TerminalMessage]? = nil,
+        presentShareSheet: Bool
+    ) {
+        let data = customMessages ?? messages
+        guard !data.isEmpty else {
+            showAppMessage("No terminal messages to export.")
+            return
+        }
+
+        do {
+            let fileURL = try ExportService.exportMessages(
+                messages: data,
+                formatRawValue: settings.exportFormat,
+                reason: reason
+            )
+            if presentShareSheet {
+                shareItem = ExportShareItem(url: fileURL)
+                showAppMessage("Exported \(data.count) messages. Share or Save to Files from the sheet.")
+            } else {
+                showAppMessage(
+                    "Exported \(data.count) messages to \(fileURL.lastPathComponent).\nFind it in \(ExportService.userVisibleExportsPathHint)."
+                )
+            }
+        } catch {
+            showAppMessage("Export failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func exportDiagnostics(presentShareSheet: Bool) {
+        do {
+            let fileURL = try ExportService.exportDiagnostics(
+                events: bluetoothManager.bleEventLog,
+                rawPackets: bluetoothManager.rawPackets
+            )
+            if presentShareSheet {
+                shareItem = ExportShareItem(url: fileURL)
+                showAppMessage("Diagnostics exported. Share or Save to Files from the sheet.")
+            } else {
+                showAppMessage(
+                    "Diagnostics exported to \(fileURL.lastPathComponent).\nFind it in \(ExportService.userVisibleExportsPathHint)."
+                )
+            }
+        } catch {
+            showAppMessage("Diagnostics export failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func toggleSearch() {
+        withAnimation {
+            showSearch.toggle()
+        }
+
+        if !showSearch {
+            searchText = ""
+            selectedSearchMessageID = nil
+            currentSearchResult = 0
+        } else {
+            refreshSearchSelection()
         }
     }
 
@@ -396,13 +672,9 @@ struct ContentView: View {
     }
 
     private func addToCommandHistory(_ command: String) {
-        // Remove if already exists
         commandHistory.removeAll { $0 == command }
-
-        // Add to end
         commandHistory.append(command)
 
-        // Keep only last N commands (from settings)
         if commandHistory.count > settings.commandHistorySize {
             commandHistory.removeFirst()
         }
@@ -429,7 +701,9 @@ struct ContentView: View {
 
         if index < commandHistory.count - 1 {
             historyIndex = index + 1
-            messageText = commandHistory[historyIndex!]
+            if let historyIndex {
+                messageText = commandHistory[historyIndex]
+            }
         } else {
             historyIndex = nil
             messageText = ""
@@ -437,42 +711,37 @@ struct ContentView: View {
     }
 
     // MARK: - Search & Filter
-    private var filteredMessages: [TerminalMessage] {
-        var filtered = displayedMessages
-
-        // Apply direction filter
-        if let direction = filterDirection {
-            filtered = filtered.filter { $0.direction == direction }
-        }
-
-        // Apply time filter
-        filtered = filtered.filter { message in
-            filterTimeRange.contains(message.timestamp)
-        }
-
-        // Apply search filter
-        if !searchText.isEmpty {
-            filtered = filtered.filter { message in
-                message.matches(searchText: searchText, caseSensitive: caseSensitive, useRegex: useRegex)
-            }
-        }
-
-        return filtered
-    }
-
     private var searchResults: [TerminalMessage] {
         guard !searchText.isEmpty else { return [] }
-        return filteredMessages
+        return baseFilteredMessages.filter { message in
+            message.matches(searchText: searchText, caseSensitive: caseSensitive, useRegex: useRegex)
+        }
+    }
+
+    private func refreshSearchSelection() {
+        guard !searchResults.isEmpty else {
+            currentSearchResult = 0
+            selectedSearchMessageID = nil
+            return
+        }
+
+        if currentSearchResult >= searchResults.count {
+            currentSearchResult = 0
+        }
+
+        selectedSearchMessageID = searchResults[currentSearchResult].id
     }
 
     private func navigateToNextResult() {
         guard !searchResults.isEmpty else { return }
         currentSearchResult = (currentSearchResult + 1) % searchResults.count
+        selectedSearchMessageID = searchResults[currentSearchResult].id
     }
 
     private func navigateToPreviousResult() {
         guard !searchResults.isEmpty else { return }
         currentSearchResult = (currentSearchResult - 1 + searchResults.count) % searchResults.count
+        selectedSearchMessageID = searchResults[currentSearchResult].id
     }
 }
 

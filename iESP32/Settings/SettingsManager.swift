@@ -72,7 +72,7 @@ class SettingsManager: ObservableObject {
         sentMessageColorHex = "00FF00"
         receivedMessageColorHex = "FFFFFF"
         backgroundColorHex = "000000"
-        showTimestamps = true
+        showTimestamps = false
         timestampFormat = "HH:mm:ss"
 
         autoScroll = true
