@@ -89,6 +89,8 @@ class BluetoothManager: NSObject, ObservableObject {
     private var txCharacteristic: CBCharacteristic?
     private var rxCharacteristic: CBCharacteristic?
     private var txWriteType: CBCharacteristicWriteType = .withResponse
+    private var queuedWritesWithoutResponse: [PendingWrite] = []
+    private let maxQueuedWritesWithoutResponse = 128
     private var connectionTimer: Timer?
     private var rssiTimer: Timer?
     private var durationTimer: Timer?
@@ -119,6 +121,11 @@ class BluetoothManager: NSObject, ObservableObject {
     private var pendingSentMessageIDs: [UUID] = []
     private let maxStoredEvents = 1000
     private let maxStoredPackets = 1000
+
+    private struct PendingWrite {
+        let data: Data
+        let messageID: UUID?
+    }
 
     // MARK: - Initialization
     override init() {
@@ -215,22 +222,29 @@ class BluetoothManager: NSObject, ObservableObject {
             return false
         }
 
-        if let messageID {
-            pendingSentMessageIDs.append(messageID)
-        }
-        connectedDevice.writeValue(data, for: txCharacteristic, type: txWriteType)
-        appendEvent("TX \(data.count) bytes")
-        appendRawPacket(direction: .tx, payload: data)
+        switch txWriteType {
+        case .withResponse:
+            if let messageID {
+                pendingSentMessageIDs.append(messageID)
+            }
+            connectedDevice.writeValue(data, for: txCharacteristic, type: .withResponse)
+            recordSuccessfulWrite(data: data, eventSuffix: "")
+            return true
 
-        // Update stats
-        bytesSent += data.count
-        messagesSent += 1
-        bytesInLastSecond += data.count
-        if txWriteType == .withoutResponse, let messageID {
-            onMessageDeliveryStatusChanged?(messageID, .delivered)
-            pendingSentMessageIDs.removeAll { $0 == messageID }
+        case .withoutResponse:
+            return enqueueOrSendWithoutResponse(
+                PendingWrite(data: data, messageID: messageID),
+                peripheral: connectedDevice,
+                characteristic: txCharacteristic
+            )
+
+        @unknown default:
+            if let messageID {
+                onMessageDeliveryStatusChanged?(messageID, .failed)
+            }
+            appendEvent(level: "error", "TX failed: unsupported write type")
+            return false
         }
-        return true
     }
 
     // MARK: - Stats Methods
@@ -350,6 +364,12 @@ class BluetoothManager: NSObject, ObservableObject {
             onMessageDeliveryStatusChanged?(messageID, .failed)
         }
         pendingSentMessageIDs.removeAll()
+        for pendingWrite in queuedWritesWithoutResponse {
+            if let messageID = pendingWrite.messageID {
+                onMessageDeliveryStatusChanged?(messageID, .failed)
+            }
+        }
+        queuedWritesWithoutResponse.removeAll()
 
         // Clear receive buffer
         receiveBuffer = ""
@@ -376,6 +396,60 @@ class BluetoothManager: NSObject, ObservableObject {
         rawPackets.append(RawPacket(direction: direction, payload: payload))
         if rawPackets.count > maxStoredPackets {
             rawPackets.removeFirst(rawPackets.count - maxStoredPackets)
+        }
+    }
+
+    private func recordSuccessfulWrite(data: Data, eventSuffix: String) {
+        appendEvent("TX \(data.count) bytes\(eventSuffix)")
+        appendRawPacket(direction: .tx, payload: data)
+        bytesSent += data.count
+        messagesSent += 1
+        bytesInLastSecond += data.count
+    }
+
+    private func enqueueOrSendWithoutResponse(
+        _ pendingWrite: PendingWrite,
+        peripheral: CBPeripheral,
+        characteristic: CBCharacteristic
+    ) -> Bool {
+        if queuedWritesWithoutResponse.isEmpty, peripheral.canSendWriteWithoutResponse {
+            peripheral.writeValue(pendingWrite.data, for: characteristic, type: .withoutResponse)
+            recordSuccessfulWrite(data: pendingWrite.data, eventSuffix: " (withoutResponse)")
+            if let messageID = pendingWrite.messageID {
+                onMessageDeliveryStatusChanged?(messageID, .delivered)
+            }
+            return true
+        }
+
+        guard queuedWritesWithoutResponse.count < maxQueuedWritesWithoutResponse else {
+            appendEvent(level: "error", "TX queue full for withoutResponse writes")
+            if let messageID = pendingWrite.messageID {
+                onMessageDeliveryStatusChanged?(messageID, .failed)
+            }
+            showAlert(message: "Send queue is full. Please wait and try again.")
+            return false
+        }
+
+        queuedWritesWithoutResponse.append(pendingWrite)
+        appendEvent("TX queued (\(queuedWritesWithoutResponse.count) pending)")
+        drainWithoutResponseQueue(peripheral: peripheral, characteristic: characteristic)
+        return true
+    }
+
+    private func drainWithoutResponseQueue(peripheral: CBPeripheral? = nil, characteristic: CBCharacteristic? = nil) {
+        guard txWriteType == .withoutResponse else { return }
+        guard let targetPeripheral = peripheral ?? connectedDevice,
+              let targetCharacteristic = characteristic ?? txCharacteristic else {
+            return
+        }
+
+        while targetPeripheral.canSendWriteWithoutResponse && !queuedWritesWithoutResponse.isEmpty {
+            let pendingWrite = queuedWritesWithoutResponse.removeFirst()
+            targetPeripheral.writeValue(pendingWrite.data, for: targetCharacteristic, type: .withoutResponse)
+            recordSuccessfulWrite(data: pendingWrite.data, eventSuffix: " (withoutResponse)")
+            if let messageID = pendingWrite.messageID {
+                onMessageDeliveryStatusChanged?(messageID, .delivered)
+            }
         }
     }
 
@@ -757,6 +831,13 @@ extension BluetoothManager: CBPeripheralDelegate {
 
             isTransportReady = characteristic.isNotifying && txCharacteristic != nil
             appendEvent("RX notifications active: \(characteristic.isNotifying)")
+        }
+    }
+
+    nonisolated func peripheralIsReady(toSendWriteWithoutResponse peripheral: CBPeripheral) {
+        Task { @MainActor in
+            guard peripheral.identifier == connectedDevice?.identifier else { return }
+            drainWithoutResponseQueue(peripheral: peripheral, characteristic: txCharacteristic)
         }
     }
 }

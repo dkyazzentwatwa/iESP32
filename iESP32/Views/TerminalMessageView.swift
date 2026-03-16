@@ -13,10 +13,26 @@ struct TerminalMessageView: View {
     let lineNumber: Int?
     let isHighlighted: Bool
 
-    private var timeString: String {
+    // MARK: - Static Formatters (performance optimization)
+    private static let timeFormatter: DateFormatter = {
         let formatter = DateFormatter()
-        formatter.dateFormat = settings.timestampFormat == "relative" ? "HH:mm:ss" : settings.timestampFormat
-        return formatter.string(from: message.timestamp)
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter
+    }()
+
+    private static let timeWithMsFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        return formatter
+    }()
+
+    private var timeString: String {
+        switch settings.timestampFormat {
+        case "HH:mm:ss.SSS":
+            return Self.timeWithMsFormatter.string(from: message.timestamp)
+        default:
+            return Self.timeFormatter.string(from: message.timestamp)
+        }
     }
 
     private var relativeTimeString: String {

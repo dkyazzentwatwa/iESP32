@@ -427,10 +427,29 @@ struct ContentView: View {
     }
 
     private func clearTerminal() {
-        for message in messages {
-            modelContext.delete(message)
-        }
+        // Perform deletions in batches to avoid blocking UI
+        let messagesToDelete = Array(messages)
         selectedSearchMessageID = nil
+
+        // Delete in batches of 100 with yields between batches
+        Task {
+            let batchSize = 100
+            for i in stride(from: 0, to: messagesToDelete.count, by: batchSize) {
+                let end = min(i + batchSize, messagesToDelete.count)
+                let batch = messagesToDelete[i..<end]
+
+                await MainActor.run {
+                    for message in batch {
+                        modelContext.delete(message)
+                    }
+                }
+
+                // Yield to allow UI updates between batches
+                if end < messagesToDelete.count {
+                    try? await Task.sleep(nanoseconds: 1_000_000) // 1ms
+                }
+            }
+        }
     }
 
     private func configureCallbacks() {
@@ -584,8 +603,16 @@ struct ContentView: View {
         let overflow = messages.count - settings.messageBufferSize
         guard overflow > 0 else { return }
 
-        for message in messages.prefix(overflow) {
-            modelContext.delete(message)
+        // Delete in smaller batches to avoid blocking UI
+        let messagesToDelete = Array(messages.prefix(overflow))
+        let batchSize = min(overflow, 50) // Delete at most 50 at a time
+
+        Task {
+            for i in 0..<batchSize {
+                await MainActor.run {
+                    modelContext.delete(messagesToDelete[i])
+                }
+            }
         }
     }
 
